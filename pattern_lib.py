@@ -1,10 +1,22 @@
 import collections
+import copy
+import math
+import scipy.optimize
 import svg.path
 
 from xml.dom import minidom
 
 ERROR = 1e-5
 NO_GROUP = '#000000'
+
+
+class KState(object):
+
+  def __init__(self, lengths, angles, pos0, v0):
+    self.lengths = lengths
+    self.angles = angles
+    self.pos0 = pos0
+    self.v0 = v0
 
 
 class Edge(object):
@@ -16,6 +28,10 @@ class Edge(object):
 
   def Length(self):
     return sum(segment.length(error=ERROR) for segment in self._path)
+
+  def Reduce(self):
+    r_path = svg.path.Path(*[svg.path.Line(s.start, s.end) for s in self._path])
+    return Edge(r_path, self.group, self.is_fixed)
 
 
 def _ParseStyle(path_element, group_map):
@@ -55,3 +71,87 @@ def ParseImage(input_str):
     edge_map[group].append(Edge(path, group, is_fixed))
   return {group: _SortEdges(edges) if group else edges
           for group, edges in edge_map.iteritems()}
+
+
+def _PathToState(path):
+  def _Vec(start, end):
+    v = end - start
+    return v / abs(v)
+  def _Angle(u, v):
+    return math.copysign(
+        math.acos(u.real * v.real + u.imag * v.imag),
+        u.real * v.imag - u.imag * v.real)
+  lengths = []
+  angles = []
+  v0 = _Vec(path[0].start, path[-1].end)
+  v = v0
+  for segment in path:
+    lengths.append(segment.length())
+    n_v = _Vec(segment.start, segment.end)
+    angles.append(_Angle(v, n_v))
+    v = n_v
+  return KState(lengths, angles, path[0].start, v0)
+
+
+def _ChainToPath(chain):
+  segments = []
+  start = chain[0]
+  for end in chain[1:]:
+    segments.append(svg.path.Line(start, end))
+    start = end
+  return svg.path.Path(*segments)
+
+
+def _ForwardK(state):
+  def _Rotate(v, theta):
+    return (v.real * math.cos(theta) - v.imag * math.sin(theta) +
+            (v.real * math.sin(theta) + v.imag * math.cos(theta)) * 1j)
+  chain = [state.pos0]
+  v = state.v0
+  for length, angle in zip(state.lengths, state.angles):
+    v = _Rotate(v, angle)
+    chain.append(chain[-1] + length * v)
+  return chain
+
+
+def _ResizeReducedEdge(edge, target_length):
+  # Get starting state
+  state0 = _PathToState(edge._path)
+
+  # Scale state
+  scale = target_length / edge.Length()
+  state0.lengths = [scale * l for l in state0.lengths]
+
+  # Optimize state
+  def _ObjectiveF(angles):
+    def _Distance(a, b):
+      return abs(a - b)
+    return sum(_Distance(a, b) for a, b in zip(angles, state0.angles))
+  def _ConstraintXF(angles):
+    state = copy.copy(state0)
+    state.angles = angles
+    return _ForwardK(state)[-1].real - edge._path[-1].end.real
+  def _ConstraintYF(angles):
+    state = copy.copy(state0)
+    state.angles = angles
+    return _ForwardK(state)[-1].imag - edge._path[-1].end.imag
+  constraints = [
+      {'type': 'eq', 'fun': _ConstraintXF},
+      {'type': 'eq', 'fun': _ConstraintYF},
+  ]
+  r = scipy.optimize.minimize(
+      _ObjectiveF, state0.angles,
+      constraints=constraints)
+  if not r.success:
+    raise Exception('Optimization failed:\n%s' % r)
+  final_state = copy.copy(state0)
+  final_state.angles = r.x
+
+  # Output edge
+  return Edge(_ChainToPath(_ForwardK(final_state)), edge.group, edge.is_fixed)
+
+
+def ResizeEdge(edge, target_length):
+  r_edge = edge.Reduce()
+  target_r_length = (target_length * r_edge.Length()) / edge.Length()
+  return _ResizeReducedEdge(edge, target_r_length)
