@@ -1,6 +1,8 @@
 import collections
 import copy
 import math
+import numpy
+import numpy.linalg
 import scipy.optimize
 import svg.path
 
@@ -73,21 +75,34 @@ def ParseImage(input_str):
           for group, edges in edge_map.iteritems()}
 
 
+def _IsLine(segment):
+  return type(segment) is svg.path.Line
+
+
+def _DirVec(start, end):
+  v = end - start
+  return v / abs(v)
+
+
+def _Angle(u, v):
+  return math.copysign(
+      math.acos((u.real * v.real + u.imag * v.imag) / (abs(u) * abs(v))),
+      u.real * v.imag - u.imag * v.real)
+
+
+def _Rotate(v, theta):
+    return (v.real * math.cos(theta) - v.imag * math.sin(theta) +
+            (v.real * math.sin(theta) + v.imag * math.cos(theta)) * 1j)
+
+
 def _PathToState(path):
-  def _Vec(start, end):
-    v = end - start
-    return v / abs(v)
-  def _Angle(u, v):
-    return math.copysign(
-        math.acos(u.real * v.real + u.imag * v.imag),
-        u.real * v.imag - u.imag * v.real)
   lengths = []
   angles = []
-  v0 = _Vec(path[0].start, path[-1].end)
+  v0 = _DirVec(path[0].start, path[-1].end)
   v = v0
   for segment in path:
-    lengths.append(segment.length())
-    n_v = _Vec(segment.start, segment.end)
+    lengths.append(segment.length(error=ERROR))
+    n_v = _DirVec(segment.start, segment.end)
     angles.append(_Angle(v, n_v))
     v = n_v
   return KState(lengths, angles, path[0].start, v0)
@@ -103,9 +118,6 @@ def _ChainToPath(chain):
 
 
 def _ForwardK(state):
-  def _Rotate(v, theta):
-    return (v.real * math.cos(theta) - v.imag * math.sin(theta) +
-            (v.real * math.sin(theta) + v.imag * math.cos(theta)) * 1j)
   chain = [state.pos0]
   v = state.v0
   for length, angle in zip(state.lengths, state.angles):
@@ -140,8 +152,7 @@ def _ResizeReducedEdge(edge, target_length):
       {'type': 'eq', 'fun': _ConstraintYF},
   ]
   r = scipy.optimize.minimize(
-      _ObjectiveF, state0.angles,
-      constraints=constraints)
+      _ObjectiveF, state0.angles, constraints=constraints)
   if not r.success:
     raise Exception('Optimization failed:\n%s' % r)
   final_state = copy.copy(state0)
@@ -151,7 +162,104 @@ def _ResizeReducedEdge(edge, target_length):
   return Edge(_ChainToPath(_ForwardK(final_state)), edge.group, edge.is_fixed)
 
 
+def _TransformPoint(pos, T):
+  x = numpy.array([pos.real, pos.imag, 1])
+  y = numpy.dot(T, x)
+  y /= y[2]
+  return y[0] + y[1] * 1j
+
+
+def _TransformCurve(curve, line):
+  v = curve.end - curve.start
+  vt = line.end - line.start
+  s = abs(vt) / abs(v)
+  theta = -1 * _Angle(v, vt)
+  T = numpy.array([
+      [s * math.cos(theta),
+       s * math.sin(theta),
+       (-1 * s * curve.start.real * math.cos(theta) -
+        s * curve.start.imag * math.sin(theta) +
+        line.start.real)],
+      [-s * math.sin(theta),
+       s * math.cos(theta),
+       (s * curve.start.real * math.sin(theta) -
+        s * curve.start.imag * math.cos(theta) +
+        line.start.imag)],
+      [0, 0, 1]])
+
+  # Build transformed curve
+  return svg.path.CubicBezier(
+      line.start, _TransformPoint(curve.control1, T),
+      _TransformPoint(curve.control2, T), line.end)
+
+
+def _EnforceSmoothness(edge, target_edge):
+  def _SegmentAngle(segment1, segment2):
+    u = _DirVec(segment1.control2, segment1.end)
+    v = _DirVec(segment2.start, segment2.control1)
+    return _Angle(u, v)
+  for i in xrange(1, len(edge._path)):
+    if _IsLine(edge._path[i - 1]) or _IsLine(edge._path[i]):
+      continue
+    if abs(_SegmentAngle(target_edge._path[i - 1],
+                         target_edge._path[i])) < ERROR:
+      angle = _SegmentAngle(edge._path[i - 1], edge._path[i])
+      if abs(angle) > ERROR:
+        u = edge._path[i - 1].control2 - edge._path[i - 1].end
+        u = _Rotate(u, angle / 2)
+        edge._path[i - 1].control2 = u + edge._path[i - 1].end
+
+        v = edge._path[i].control1 - edge._path[i].start
+        v = _Rotate(v, -1 * angle / 2)
+        edge._path[i].control1 = v + edge._path[i].start
+
+
+def _ScaleSegment(segment, factor):
+  segment.control1 = factor * (segment.control1 - segment.start) + segment.start
+  segment.control2 = factor * (segment.control2 - segment.end) + segment.end
+
+
+def _FinalResizeSegment(segment, target_length):
+  def _ObjectiveF(factors):
+    return (factors[0] - 1) ** 2
+  def _ConstraintF(factors):
+    scaled_segment = copy.copy(segment)
+    _ScaleSegment(scaled_segment, factors[0])
+    return scaled_segment.length(error=ERROR) - target_length
+  constraints = [{'type': 'eq', 'fun': _ConstraintF}]
+  r = scipy.optimize.minimize(
+      _ObjectiveF, [1.], constraints=constraints)
+  if not r.success:
+    raise Exception('Optimization failed:\n%s' % r)
+  _ScaleSegment(segment, r.x[0])
+
+
+def _FinalResize(edge, target_edge, scale):
+  for segment, target_segment in zip(edge._path, target_edge._path):
+    if _IsLine(segment):
+      continue
+    _FinalResizeSegment(segment, scale * target_segment.length(error=ERROR))
+
+
 def ResizeEdge(edge, target_length):
+  # Resize reduced edge
+  scale = target_length / edge.Length()
   r_edge = edge.Reduce()
-  target_r_length = (target_length * r_edge.Length()) / edge.Length()
-  return _ResizeReducedEdge(edge, target_r_length)
+  scaled_r_edge = _ResizeReducedEdge(edge, scale * r_edge.Length())
+
+  # Rough scaling of curve segments
+  segments = []
+  for segment, scaled_r_segment in zip(edge._path, scaled_r_edge._path):
+    if _IsLine(segment):
+      segments.append(scaled_r_segment)
+    else:
+      segments.append(_TransformCurve(segment, scaled_r_segment))
+  scaled_edge = Edge(svg.path.Path(*segments), edge.group, edge.is_fixed)
+
+  # Enforce smoothness
+  _EnforceSmoothness(scaled_edge, edge)
+
+  # Final resize
+  _FinalResize(scaled_edge, edge, scale)
+
+  return scaled_edge
